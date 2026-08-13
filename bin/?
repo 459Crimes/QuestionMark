@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# ? -- ask a question or run a task from the terminal, answered by OpenCode.
+# Every response belongs to a named thread <yymmdd??????> stored centrally.
+set -u
+
+DEFAULT_AGENT_TYPE="ask"
+TIMEOUT_SECS=90
+OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+THREADS_DIR="${QM_THREADS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ask-cli/threads}"
+
+# Load configuration (models, aliases, fallback). First found wins:
+#   1. $QM_CONFIG_FILE
+#   2. ~/.config/ask-cli/models.conf (XDG-aware)
+#   3. ../config/models.conf relative to this script (repo copy)
+# "default" for QM_DEFAULT_MODEL means: pass no --model flag and let opencode
+# choose its own default model.
+CONFIG_FILE="${QM_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/ask-cli/models.conf}"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  CONFIG_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../config/models.conf"
+fi
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  . "$CONFIG_FILE"
+fi
+DEFAULT_MODEL="${QM_DEFAULT_MODEL:-default}"
+FALLBACK_MODEL="${QM_FALLBACK_MODEL:-opencode/gpt-5.6-luna}"
+FALLBACK_VARIANT="${QM_FALLBACK_VARIANT:-low}"
+
+# Verify this heuristic against a real exhausted response before enabling.
+USAGE_LIMIT_PATTERN='rate.?limit|usage.?limit|quota|429|too many requests|insufficient|limit exceeded'
+
+usage() {
+  echo "usage: ? [flags] <question>" >&2
+  echo "  e.g. ? \"why is the sky blue\"" >&2
+  echo '       ? -m:luna -w:~/projects summarize this repo' >&2
+  echo "       ? -t:a1b2c3 what was the last thing we discussed" >&2
+  echo "  default model: opencode default (override with -m: or edit config)" >&2
+  echo "  model aliases: from config ($CONFIG_FILE)" >&2
+  echo "  flags:" >&2
+  echo "    -m:<model>|--model:<model>   model or alias (also 'separated value' form)" >&2
+  echo "    -w:<dir>|--workspace:<dir>   workspace directory (also separated form)" >&2
+  echo "    -a:<type>|--agent-type:<type> ask (default) or agent (task-capable)" >&2
+  echo "    -t:<id>|--thread:<id>        continue a thread by its 6-hex suffix (today) or full id" >&2
+  echo "    -l|--list                   list threads" >&2
+  echo "    -s:<term>|--search:<term>   search threads" >&2
+  echo "  threads live in: $THREADS_DIR" >&2
+}
+
+model_override=''
+model_explicit=0
+WORKSPACE_DIR="$HOME"
+AGENT_TYPE="$DEFAULT_AGENT_TYPE"
+agent_explicit=0
+thread_ref=''
+list_mode=0
+search_term=''
+question=''
+
+# Flags are parsed only before the first ordinary word. That word begins the
+# prompt and every remaining argument is part of the literal question.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|-H|--help)
+      usage
+      exit 0
+      ;;
+    -m:*|--model:*)
+      model_override="${1#*:}"
+      model_explicit=1
+      [[ -n "$model_override" ]] || { echo 'error: -m:/--model: requires a model value' >&2; exit 2; }
+      shift
+      ;;
+    -w:*|--workspace:*)
+      WORKSPACE_DIR="${1#*:}"
+      [[ -n "$WORKSPACE_DIR" ]] || { echo 'error: -w:/--workspace: requires a directory value' >&2; exit 2; }
+      shift
+      ;;
+    -a:*|--agent-type:*)
+      AGENT_TYPE="${1#*:}"
+      agent_explicit=1
+      [[ -n "$AGENT_TYPE" ]] || { echo 'error: -a:/--agent-type: requires a value (ask|agent)' >&2; exit 2; }
+      shift
+      ;;
+    -t:*|--thread:*)
+      thread_ref="${1#*:}"
+      [[ -n "$thread_ref" ]] || { echo 'error: -t:/--thread: requires a thread id' >&2; exit 2; }
+      shift
+      ;;
+    -l|--list)
+      list_mode=1
+      shift
+      ;;
+    -s:*|--search:*)
+      search_term="${1#*:}"
+      [[ -n "$search_term" ]] || { echo 'error: -s:/--search: requires a term' >&2; exit 2; }
+      shift
+      ;;
+    -m|--model)
+      [[ $# -ge 2 ]] || { echo 'error: -m/--model requires a model value' >&2; exit 2; }
+      model_override="$2"
+      model_explicit=1
+      shift 2
+      ;;
+    -w|--workspace)
+      [[ $# -ge 2 ]] || { echo 'error: -w/--workspace requires a directory value' >&2; exit 2; }
+      WORKSPACE_DIR="$2"
+      shift 2
+      ;;
+    -a|--agent-type)
+      [[ $# -ge 2 ]] || { echo 'error: -a/--agent-type requires a value (ask|agent)' >&2; exit 2; }
+      AGENT_TYPE="$2"
+      agent_explicit=1
+      shift 2
+      ;;
+    -t|--thread)
+      [[ $# -ge 2 ]] || { echo 'error: -t/--thread requires a thread id' >&2; exit 2; }
+      thread_ref="$2"
+      shift 2
+      ;;
+    -s|--search)
+      [[ $# -ge 2 ]] || { echo 'error: -s/--search requires a term' >&2; exit 2; }
+      search_term="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      question="$*"
+      break
+      ;;
+    -*)
+      echo "error: unknown option: $1" >&2
+      usage
+      exit 2
+      ;;
+    *)
+      question="$*"
+      break
+      ;;
+  esac
+done
+
+case "$AGENT_TYPE" in
+  ask|agent) ;;
+  *) echo "error: invalid agent type '$AGENT_TYPE' (must be ask or agent)" >&2; exit 2 ;;
+esac
+
+# Agent -> opencode flags. 'ask' is the read-only Q&A agent; 'agent' uses the
+# default (task-capable) opencode agent, so no --agent flag is passed.
+AGENT_FLAGS=()
+if [[ "$AGENT_TYPE" == "ask" ]]; then
+  AGENT_FLAGS=(--agent ask)
+fi
+
+if [[ -n "$model_override" && "$model_override" != */* ]]; then
+  _alias_var="QM_ALIAS_${model_override}"
+  if [[ -n "${!_alias_var:-}" ]]; then
+    model_override="${!_alias_var}"
+  fi
+fi
+
+list_threads() {
+  local term="${1:-}"
+  QM_THREADS_DIR="$THREADS_DIR" QM_SEARCH="$term" "$PYTHON_BIN" - <<'PY'
+import os, json, glob, sys
+d = os.environ["QM_THREADS_DIR"]
+term = os.environ.get("QM_SEARCH", "").lower()
+rows = []
+for p in glob.glob(os.path.join(d, "*.json")):
+    try:
+        with open(p) as f:
+            t = json.load(f)
+    except Exception:
+        continue
+    blob = json.dumps(t).lower()
+    if term and term not in blob:
+        continue
+    rows.append((t.get("updated", t.get("created", 0)), t.get("id", ""), t))
+rows.sort(reverse=True)
+if not rows:
+    print("no threads found")
+    sys.exit(0)
+print("%-13s %-6s %-30s %s" % ("ID", "AGENT", "MODEL", "QUESTION"))
+for _ts, _id, t in rows:
+    q = str(t.get("lastQuestion", t.get("question", ""))).split("\n")[0][:60]
+    print("%-13s %-6s %-30s %s" % (
+        t.get("id", ""), t.get("agentType", ""), t.get("model", ""), q))
+PY
+}
+
+rand_hex6() {
+  local h
+  if command -v openssl >/dev/null 2>&1; then
+    h="$(openssl rand -hex 3 2>/dev/null)"
+  fi
+  if [[ -z "$h" || ${#h} -ne 6 ]]; then
+    h="$(printf '%06x' $(( (RANDOM << 16 | RANDOM) % 16777216 )))"
+  fi
+  printf '%s' "$h"
+}
+
+new_thread_id() {
+  local yymmdd hex id
+  yymmdd="$(date +%y%m%d)"
+  while :; do
+    hex="$(rand_hex6)"
+    id="${yymmdd}${hex}"
+    [[ ! -e "$THREADS_DIR/$id.json" ]] && break
+  done
+  printf '%s' "$id"
+}
+
+json_get() {
+  QM_FILE="$1" QM_KEY="$2" "$PYTHON_BIN" - <<'PY'
+import os, json
+try:
+    with open(os.environ["QM_FILE"]) as f:
+        d = json.load(f)
+    print(d.get(os.environ["QM_KEY"], ""))
+except Exception:
+    print("")
+PY
+}
+
+resolve_thread() {
+  local ref="$1" id
+  case "$ref" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+      id="$(date +%y%m%d)$ref"
+      if [[ ! -f "$THREADS_DIR/$id.json" ]]; then
+        # No thread from today carries this hex suffix; fall back to the most
+        # recently updated thread with that suffix, newest first.
+        id="$(find_suffix_thread "$ref")"
+        if [[ -z "$id" ]]; then
+          echo "error: no thread found for '$ref'" >&2
+          return 2
+        fi
+      fi
+      ;;
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+      id="$ref"
+      if [[ ! -f "$THREADS_DIR/$id.json" ]]; then
+        echo "error: no thread found for '$ref'" >&2
+        return 2
+      fi
+      ;;
+    *)
+      echo "error: invalid thread id '$ref' (use 6 hex chars or the full yymmdd+6hex id)" >&2
+      return 2 ;;
+  esac
+  printf '%s' "$id"
+}
+
+find_suffix_thread() {
+  QM_THREADS_DIR="$THREADS_DIR" QM_SUFFIX="$1" "$PYTHON_BIN" - <<'PY'
+import os, json, glob, sys
+d = os.environ["QM_THREADS_DIR"]
+suffix = os.environ["QM_SUFFIX"]
+best = None
+best_ts = -1
+for p in glob.glob(os.path.join(d, "*" + suffix + ".json")):
+    try:
+        with open(p) as f:
+            t = json.load(f)
+    except Exception:
+        continue
+    if t.get("hex", "") != suffix:
+        continue
+    ts = t.get("updated", t.get("created", 0))
+    if ts > best_ts:
+        best_ts = ts
+        best = t.get("id", "")
+if best:
+    print(best)
+PY
+}
+
+save_thread() {
+  local id="$1"
+  THREAD_ID="$id" THREAD_SESSION="$SESSION_ID" THREAD_AGENT="$AGENT_TYPE" \
+  THREAD_MODEL="$thread_model" THREAD_DIR="$WORKSPACE_DIR" THREAD_Q="$question" \
+  "$PYTHON_BIN" - <<'PY'
+import os, json, time
+d = os.environ["QM_THREADS_DIR"]
+id_ = os.environ["THREAD_ID"]
+path = os.path.join(d, id_ + ".json")
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+now = int(time.time())
+data.update({
+    "id": id_,
+    "date": id_[:6],
+    "hex": id_[6:],
+    "sessionID": os.environ["THREAD_SESSION"],
+    "agentType": os.environ["THREAD_AGENT"],
+    "model": os.environ["THREAD_MODEL"],
+    "directory": os.environ["THREAD_DIR"],
+    "question": data.get("question", os.environ["THREAD_Q"]),
+    "lastQuestion": os.environ["THREAD_Q"],
+    "updated": now,
+})
+data.setdefault("created", now)
+os.makedirs(d, exist_ok=True)
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+}
+
+if [[ $list_mode -eq 1 ]]; then
+  list_threads
+  exit 0
+fi
+
+if [[ -n "$search_term" ]]; then
+  list_threads "$search_term"
+  exit 0
+fi
+
+if [[ -z "$question" ]]; then
+  usage
+  exit 2
+fi
+
+if [[ ! -d "$WORKSPACE_DIR" ]]; then
+  echo "error: workspace is not a directory: $WORKSPACE_DIR" >&2
+  exit 2
+fi
+
+if ! command -v "$OPENCODE_BIN" >/dev/null 2>&1; then
+  echo 'error: opencode CLI not found in PATH' >&2
+  exit 127
+fi
+
+run_with_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$TIMEOUT_SECS" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$TIMEOUT_SECS" "$@"
+  else
+    # macOS has neither GNU timeout nor gtimeout by default.
+    perl -e 'my $seconds = shift @ARGV; alarm($seconds); exec @ARGV;' "$TIMEOUT_SECS" "$@"
+  fi
+}
+
+parse_json_output() {
+  QM_JSON="$1" "$PYTHON_BIN" - <<'PY'
+import json, os, sys
+sid = None
+texts = []
+with open(os.environ["QM_JSON"], encoding="utf-8", errors="replace") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(e, dict):
+            continue
+        if sid is None:
+            sid = e.get("sessionID") or None
+        if e.get("type") == "text":
+            p = e.get("part") or {}
+            if p.get("type") == "text" and isinstance(p.get("text"), str):
+                texts.append(p["text"])
+print(sid or "")
+print("<<<ANSWER>>>")
+print("".join(texts))
+PY
+}
+
+run_model() {
+  local mdl="$1" variant="${2:-}" sid="${3:-}"
+  local stdout_file stderr_file status parsed new_sid
+  local mdl_display="$mdl"
+  [[ "$mdl_display" == "default" ]] && mdl_display="opencode default model"
+  printf '[thinking… %s]\n' "$mdl_display" >&2
+  stdout_file="$(mktemp)" || return 125
+  stderr_file="$(mktemp)" || { rm -f -- "$stdout_file"; return 125; }
+  local args=( "$OPENCODE_BIN" run --format json --auto --dir "$WORKSPACE_DIR" )
+  [[ -n "$mdl" && "$mdl" != "default" ]] && args+=( --model "$mdl" )
+  [[ ${#AGENT_FLAGS[@]} -gt 0 ]] && args+=( "${AGENT_FLAGS[@]}" )
+  [[ -n "$variant" ]] && args+=( --variant "$variant" )
+  [[ -n "$sid" ]] && args+=( --session "$sid" )
+  run_with_timeout "${args[@]}" -- "$question" >"$stdout_file" 2>"$stderr_file"
+  status=$?
+  RUN_RAW="$(<"$stdout_file")"
+  RUN_ERR="$(<"$stderr_file")"
+  parsed="$(parse_json_output "$stdout_file")"
+  rm -f -- "$stdout_file" "$stderr_file"
+  new_sid="$(printf '%s\n' "$parsed" | sed -n '1p')"
+  [[ -n "$new_sid" ]] && SESSION_ID="$new_sid"
+  RUN_ANSWER="$(printf '%s\n' "$parsed" | sed -n '3,$p')"
+  return "$status"
+}
+
+# Determine thread: continuing an existing one, or creating a new thread id.
+SESSION_ID=''
+if [[ -n "$thread_ref" ]]; then
+  THREAD_ID="$(resolve_thread "$thread_ref")" || { echo "  current threads in: $THREADS_DIR" >&2; exit 2; }
+  if [[ $model_explicit -eq 0 ]]; then
+    thread_model="$(json_get "$THREADS_DIR/$THREAD_ID.json" model)"
+  else
+    thread_model="$model_override"
+  fi
+  if [[ $agent_explicit -eq 0 ]]; then
+    AGENT_TYPE="$(json_get "$THREADS_DIR/$THREAD_ID.json" agentType)"
+    case "$AGENT_TYPE" in
+      ask) AGENT_FLAGS=(--agent ask) ;;
+      agent) AGENT_FLAGS=() ;;
+      *) echo "error: stored thread '$THREAD_ID' has invalid agent type '$AGENT_TYPE'" >&2; exit 2 ;;
+    esac
+  fi
+  SESSION_ID="$(json_get "$THREADS_DIR/$THREAD_ID.json" sessionID)"
+  thread_model="${thread_model:-$DEFAULT_MODEL}"
+else
+  THREAD_ID="$(new_thread_id)"
+  thread_model="${model_override:-$DEFAULT_MODEL}"
+fi
+
+run_model "$thread_model" "" "$SESSION_ID"
+code=$?
+
+if [[ $code -eq 0 ]]; then
+  printf '%s\n' "$RUN_ANSWER"
+  if [[ -n "$SESSION_ID" ]]; then
+    save_thread "$THREAD_ID"
+  fi
+  printf '[thread %s]%s\n' "$THREAD_ID" "$([[ -n "$thread_ref" ]] && echo ' (continued)' || true)" >&2
+  exit 0
+fi
+
+if [[ $model_explicit -eq 0 ]] && \
+   printf '%s\n%s' "$RUN_RAW" "$RUN_ERR" | grep -qiE "$USAGE_LIMIT_PATTERN"; then
+  echo "[falling back to $FALLBACK_MODEL ($FALLBACK_VARIANT) -- $thread_model usage limit reached]" >&2
+  run_model "$FALLBACK_MODEL" "$FALLBACK_VARIANT" "$SESSION_ID"
+  thread_model="$FALLBACK_MODEL"
+  code=$?
+  if [[ $code -eq 0 ]]; then
+    printf '%s\n' "$RUN_ANSWER"
+    if [[ -n "$SESSION_ID" ]]; then
+      save_thread "$THREAD_ID"
+    fi
+    printf '[thread %s]%s\n' "$THREAD_ID" "$([[ -n "$thread_ref" ]] && echo ' (continued)' || true)" >&2
+    exit 0
+  fi
+  echo "error: fallback model '$FALLBACK_MODEL' also failed:" >&2
+  printf '%s\n' "$RUN_ANSWER" "$RUN_ERR" >&2
+  exit "$code"
+fi
+
+if [[ -n "$SESSION_ID" ]]; then
+  save_thread "$THREAD_ID"
+fi
+echo 'error: opencode call failed (not a usage-limit error, no fallback attempted):' >&2
+printf '%s\n' "$RUN_ANSWER" "$RUN_ERR" >&2
+exit "$code"
