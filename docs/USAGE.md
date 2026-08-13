@@ -3,10 +3,10 @@
 ## Quick reference
 
 ```
-usage: ? [flags] <question>
+usage: ? [flags] "<question>"
   e.g. ? "why is the sky blue"
-       ? -m:opencode/gpt-5.6-luna -w:~/projects summarize this repo
-       ? -t:a1b2c3 what was the last thing we discussed
+       ? -m:luna -w:~/projects "summarize this repo"
+       ? -t:a1b2c3 "what was the last thing we discussed"
 
 model aliases: from config (default set: luna, terra, sol, deep, flash, gemma, opus, grok)
 
@@ -19,10 +19,17 @@ flags:
   -s:<term> | --search:<term>     search threads
 ```
 
+> **Always quote your question.** The command is literally named `?` and the
+> shell treats `*`, `?`, and other metacharacters specially. Wrap your question
+> in double quotes every time: `? "why is the sky blue"` — a bare question like
+> `? why is the sky blue?` can be mangled by shell globbing, and a question
+> starting with `-` (e.g. `? -m is that a flag?`) is read as an option.
+>
 > **Flag rule:** flags are parsed **only before the first ordinary word**.
 > Once the first non-flag argument appears, everything after it is part of the
-> literal question. That's why `? why is the sky blue` needs no quotes.
-> Hyphen-first prompts: use `--` to force-quote — `? -- -m is that a flag?`.
+> literal question.
+> If a question itself starts with a hyphen you must still quote it, and to be
+> explicit use `--` to end flag parsing: `? -- "-m is that a flag?"`.
 
 ---
 
@@ -151,11 +158,12 @@ If a *default* model call fails with a usage-limit signature (`rate limit`,
 
 ## Part-of-speech detail: `--`
 
-Everything after a literal `--` is the question, even leading dashes:
+Everything after a literal `--` is the question, even leading dashes. Always
+still quote it:
 
 ```sh
-? -- -m:is this a flag or a word?
-? -- --verbose is still terminal jargon
+? -- "-m:is this a flag or a word?"
+? -- "--verbose is still terminal jargon"
 ```
 
 ---

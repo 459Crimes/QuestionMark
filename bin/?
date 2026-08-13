@@ -31,10 +31,12 @@ FALLBACK_VARIANT="${QM_FALLBACK_VARIANT:-low}"
 USAGE_LIMIT_PATTERN='rate.?limit|usage.?limit|quota|429|too many requests|insufficient|limit exceeded'
 
 usage() {
-  echo "usage: ? [flags] <question>" >&2
-  echo "  e.g. ? \"why is the sky blue\"" >&2
-  echo '       ? -m:luna -w:~/projects summarize this repo' >&2
-  echo "       ? -t:a1b2c3 what was the last thing we discussed" >&2
+  echo "usage: ? [flags] \"<question>\"" >&2
+  echo '  IMPORTANT: always wrap your question in double quotes — the shell' >&2
+  echo '  treats *, ?, and other characters specially if the question is bare.' >&2
+  echo '  e.g. ? "why is the sky blue"' >&2
+  echo '       ? -m:luna -w:~/projects "summarize this repo"' >&2
+  echo '       ? -t:a1b2c3 "what was the last thing we discussed"' >&2
   echo "  default model: opencode default (override with -m: or edit config)" >&2
   echo "  model aliases: from config ($CONFIG_FILE)" >&2
   echo "  flags:" >&2

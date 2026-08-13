@@ -6,15 +6,17 @@ command line — no IDE, no browser, no chat window. Every answer belongs to a
 named **thread** you can continue, list, or search later.
 
 ```console
-$ ? why is the sky blue
+$ ? "why is the sky blue"
 [thinking… opencode default model]
 Rayleigh scattering scatters shorter wavelengths (blue) more than longer ones...
 
 [thread 260813a1b2c3]
 ```
 
-- **Zero chrome.** Flag parsing happens before the first ordinary word, so
-  prompt quoting is optional: `? why is the sky blue` just works.
+- **Zero chrome.** Flags parse before the first ordinary word, so questions
+  flow naturally — but **always wrap your question in double quotes**:
+  `? "why is the sky blue"`. The command is named `?` and the shell expands
+  `*`, `?`, and other characters in an unquoted question, breaking it.
 - **Read-only by default.** The built-in `ask` agent can read your local
   knowledge base but cannot edit files, run shell commands, or browse the web.
 - **Task-capable on demand.** `? -a:agent` switches to a full task agent that

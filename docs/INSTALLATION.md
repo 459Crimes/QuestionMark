@@ -112,11 +112,15 @@ shell/ask-cli.bashrc alias block for interactive shells (optional)
 
 ### Linux / macOS — via install.sh
 
+> **Always quote your question.** The command is literally named `?`, and the
+> shell treats `*`, `?`, and other metacharacters specially in an unquoted
+> prompt. Use `? "your question here"` — never a bare question.
+
 ```sh
 git clone https://github.com/459Crimes/QuestionMark.git
 cd QuestionMark
 ./install.sh --prefix ~/.local/bin
-? -h
+? "why is the sky blue"
 ```
 
 `install.sh` copies `bin/?` to `--prefix` (default `~/.local/bin`) and
